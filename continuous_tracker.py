@@ -13,7 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-MCP_SERVER_URL = "http://127.0.0.1:8000/sse"
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000/sse")
 
 DATA_DIR = "data"
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.txt")
