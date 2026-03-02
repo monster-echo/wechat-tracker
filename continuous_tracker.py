@@ -13,6 +13,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Queue for PDF downloading tasks
+pdf_queue = asyncio.Queue()
+
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000/sse")
 
 DATA_DIR = "data"
@@ -171,6 +174,10 @@ async def fetch_latest_articles():
                                 article["date_fetched"] = today_str
                                 new_articles.append(article)
                                 history[account].append(article)
+                                
+                                # Immediately push to queue if there is a URL
+                                if url:
+                                    pdf_queue.put_nowait((account, article))
                         elif isinstance(article, str):
                             new_articles.append(
                                 {"raw": article, "date_fetched": today_str}
@@ -188,8 +195,9 @@ async def fetch_latest_articles():
                     save_history(history)
 
                     if i < len(accounts):
-                        logger.info("  Waiting 10 seconds before next account...")
-                        await asyncio.sleep(10)
+                        random_delay = random.randint(1, 10)
+                        logger.info(f"  Waiting {random_delay} seconds before next account...")
+                        await asyncio.sleep(random_delay) 
     except Exception as e:
         logger.error(f"Error during article fetch: {e}")
 
@@ -201,10 +209,10 @@ async def fetch_latest_articles():
         logger.info(f"Saved daily report to: {report_path}")
 
 
-async def download_missing_pdfs():
-    """Scan history and use Playwright to download missing PDFs."""
+async def enqueue_missing_pdfs():
+    """Scan history and queue up all historically missing PDFs."""
     history = load_history()
-    tasks = []
+    count = 0
 
     # Find everything missing a PDF
     for account, articles in history.items():
@@ -225,92 +233,124 @@ async def download_missing_pdfs():
                             break
 
                 if not already_exists:
-                    tasks.append((account, article, account_dir))
+                    pdf_queue.put_nowait((account, article))
+                    count += 1
 
-    if not tasks:
-        logger.info("No missing PDFs to download.")
-        return
+    if count > 0:
+        logger.info(f"Queued {count} historically missing PDFs for download.")
+    else:
+        logger.info("No historically missing PDFs to download.")
 
-    logger.info(f"Found {len(tasks)} missing articles. Starting Playwright export...")
 
-    try:
-        ws_endpoint = os.getenv("PLAYWRIGHT_WS_ENDPOINT")
-        async with async_playwright() as p:
-            if ws_endpoint:
-                logger.info(f"Connecting to remote browser at {ws_endpoint}")
-                browser = await p.chromium.connect(ws_endpoint)
-            else:
-                browser = await p.chromium.launch(headless=True)
-            
-            context = await browser.new_context()
-            page = await context.new_page()
+async def pdf_worker():
+    """Background worker that consumes the pdf_queue and downloads PDFs."""
+    logger.info("PDF Worker started.")
 
-            for account, article, account_dir in tasks:
-                url = article.get("url")
-                title = article.get("title", "Untitled")
-                safe_title = sanitize_filename(title) or "Untitled"
-                logger.info(f"Loading: {title} ...")
+    while True:
+        try:
+            # Initial wait or re-connect wait
+            account, article = await pdf_queue.get()
+        except asyncio.CancelledError:
+            break
+
+        try:
+            ws_endpoint = os.getenv("PLAYWRIGHT_WS_ENDPOINT")
+            async with async_playwright() as p:
+                if ws_endpoint:
+                    logger.info(f"Connecting to remote browser at {ws_endpoint}")
+                    browser = await p.chromium.connect(ws_endpoint)
+                else:
+                    browser = await p.chromium.launch(headless=True)
+                
+                context = await browser.new_context()
+                page = await context.new_page()
+
+                # Process the first task we got, and any others that arrive while the browser is open
+                current_task = (account, article)
                 try:
-                    await page.goto(url, wait_until="networkidle", timeout=30000)
-
-                    publish_time_unix = await page.evaluate("window.ct")
-                    if publish_time_unix:
+                    while current_task is not None:
+                        curr_account, curr_article = current_task
+                        
+                        account_dir = os.path.join(PDF_DIR, sanitize_filename(curr_account))
+                        os.makedirs(account_dir, exist_ok=True)
+                        
+                        url = curr_article.get("url")
+                        title = curr_article.get("title", "Untitled")
+                        safe_title = sanitize_filename(title) or "Untitled"
+                        logger.info(f"Loading: {title} ...")
                         try:
-                            from datetime import datetime
-                            date_str = datetime.fromtimestamp(int(publish_time_unix)).strftime("%Y-%m-%d")
-                        except Exception:
-                            date_str = article.get("date") or article.get("date_fetched") or "unknown_date"
-                    else:
-                        date_str = article.get("date") or article.get("date_fetched") or "unknown_date"
+                            await page.goto(url, wait_until="networkidle", timeout=30000)
 
-                    pdf_path = os.path.join(account_dir, f"[{date_str}] {safe_title}.pdf")
-                    filename = os.path.basename(pdf_path)
-                    logger.info(f"Exporting: {filename} ...")
+                            publish_time_unix = await page.evaluate("window.ct")
+                            if publish_time_unix:
+                                try:
+                                    from datetime import datetime
+                                    date_str = datetime.fromtimestamp(int(publish_time_unix)).strftime("%Y-%m-%d")
+                                except Exception:
+                                    date_str = curr_article.get("date") or curr_article.get("date_fetched") or "unknown_date"
+                            else:
+                                date_str = curr_article.get("date") or curr_article.get("date_fetched") or "unknown_date"
 
-                    # Scroll through the page progressively to trigger all lazy-loaded images
-                    await page.evaluate(
-                        """
-                        async () => {
-                            await new Promise((resolve) => {
-                                let totalHeight = 0;
-                                const distance = 200;
-                                const timer = setInterval(() => {
-                                    const scrollHeight = document.body.scrollHeight;
-                                    window.scrollBy(0, distance);
-                                    totalHeight += distance;
+                            pdf_path = os.path.join(account_dir, f"[{date_str}] {safe_title}.pdf")
+                            filename = os.path.basename(pdf_path)
+                            logger.info(f"Exporting: {filename} ...")
 
-                                    if(totalHeight >= scrollHeight - window.innerHeight){
-                                        clearInterval(timer);
-                                        resolve();
-                                    }
-                                }, 100);
-                            });
-                        }
-                    """
-                    )
+                            # Scroll through the page progressively to trigger all lazy-loaded images
+                            await page.evaluate(
+                                """
+                                async () => {
+                                    await new Promise((resolve) => {
+                                        let totalHeight = 0;
+                                        const distance = 200;
+                                        const timer = setInterval(() => {
+                                            const scrollHeight = document.body.scrollHeight;
+                                            window.scrollBy(0, distance);
+                                            totalHeight += distance;
 
-                    # Wait an extra 5~6 seconds for images/scripts to settle
-                    await page.wait_for_timeout(6000)
+                                            if(totalHeight >= scrollHeight - window.innerHeight){
+                                                clearInterval(timer);
+                                                resolve();
+                                            }
+                                        }, 100);
+                                    });
+                                }
+                            """
+                            )
 
-                    await page.pdf(path=pdf_path, format="A4")
-                    logger.info(f"  -> Saved to {pdf_path}")
-                except Exception as e:
-                    logger.error(f"  -> Error exporting: {e}")
+                            # Wait an extra 5~6 seconds for images/scripts to settle
+                            await page.wait_for_timeout(6000)
 
-            await browser.close()
-    except Exception as e:
-        logger.error(f"Playwright error: {e}")
+                            await page.pdf(path=pdf_path, format="A4")
+                            logger.info(f"  -> Saved to {pdf_path}")
+                        except Exception as e:
+                            logger.error(f"  -> Error exporting: {e}")
+                        finally:
+                            pdf_queue.task_done()
+                            
+                        # Try to get another task without blocking, to reuse the open browser
+                        try:
+                            current_task = pdf_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            current_task = None
+
+                finally:
+                    await browser.close()
+        except asyncio.CancelledError:
+            logger.info("PDF Worker shutting down...")
+            break
+        except Exception as e:
+            logger.error(f"Playwright error in worker: {e}")
 
 
 async def scheduled_job():
     """The main routine that runs on the configured schedule."""
     logger.info(">>> STARTING SCHEDULED JOB <<<")
 
-    # 1. Fetch new articles
-    await fetch_latest_articles()
+    # 1. Queue historically missing PDFs
+    await enqueue_missing_pdfs()
 
-    # 2. Download any new or historically missing PDFs
-    await download_missing_pdfs()
+    # 2. Fetch new articles (this will concurrently enqueue PDFs)
+    await fetch_latest_articles()
 
     logger.info("<<< FINISHED SCHEDULED JOB >>>")
 
@@ -319,6 +359,9 @@ async def main():
     logger.info("Initializing APScheduler...")
     scheduler = AsyncIOScheduler()
 
+    # Start the background worker for downloading PDFs
+    worker_task = asyncio.create_task(pdf_worker())
+
     # Schedule the job to run every hour
     scheduler.add_job(scheduled_job, "interval", hours=1)
     scheduler.start()
@@ -326,14 +369,15 @@ async def main():
     # Run the first job immediately
     await scheduled_job()
 
-    logger.info("Scheduler is active. Press Ctrl+C to exit.")
+    logger.info("Scheduler and global PDF worker are active. Press Ctrl+C to exit.")
 
     try:
         # Keep the main async loop running
         while True:
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutting down scheduler...")
+        logger.info("Shutting down scheduler and workers...")
+        worker_task.cancel()
 
 
 if __name__ == "__main__":
