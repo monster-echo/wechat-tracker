@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+.git
+.gitignore
+
+# You probably want to persist data via mounted volumes instead of baking into image
+articles_history.json
+daily_reports/
+pdf_exports/
+qrcode.png
