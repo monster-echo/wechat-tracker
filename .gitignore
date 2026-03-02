@@ -5,7 +5,6 @@ __pycache__/
 .env
 
 # Generate Data (Exclude to not pollute the GitHub repo)
-articles_history.json
 daily_reports/
 pdf_exports/
 qrcode.png
