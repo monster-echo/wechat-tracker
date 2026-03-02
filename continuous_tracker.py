@@ -227,8 +227,14 @@ async def download_missing_pdfs():
     print(f"\n[PDF] Found {len(tasks)} missing articles. Starting Playwright export...")
 
     try:
+        ws_endpoint = os.getenv("PLAYWRIGHT_WS_ENDPOINT")
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            if ws_endpoint:
+                print(f"[PDF Worker] Connecting to remote browser at {ws_endpoint}")
+                browser = await p.chromium.connect(ws_endpoint)
+            else:
+                browser = await p.chromium.launch(headless=True)
+            
             context = await browser.new_context()
             page = await context.new_page()
 
