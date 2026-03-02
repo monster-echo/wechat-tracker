@@ -7,13 +7,19 @@ from datetime import datetime
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from playwright.async_api import async_playwright
+import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 MCP_SERVER_URL = "http://127.0.0.1:8000/sse"
-ACCOUNTS_FILE = "accounts.txt"
-HISTORY_FILE = "articles_history.json"
-DAILY_FOLDER = "daily_reports"
-PDF_DIR = "pdf_exports"
+
+DATA_DIR = "data"
+ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.txt")
+HISTORY_FILE = os.path.join(DATA_DIR, "articles_history.json")
+DAILY_FOLDER = os.path.join(DATA_DIR, "daily_reports")
+PDF_DIR = os.path.join(DATA_DIR, "pdf_exports")
 
 
 def sanitize_filename(filename):
@@ -27,12 +33,12 @@ async def check_login(session):
         status = response.content[0].text
         return status == "LOGGED_IN"
     except Exception as e:
-        print(f"Error checking login status: {e}")
+        logger.error(f"Error checking login status: {e}")
         return False
 
 
 async def get_qrcode_and_wait(session):
-    print("Not logged in. Fetching login QR code...")
+    logger.info("Not logged in. Fetching login QR code...")
     response = await session.call_tool("get_login_qrcode", {})
 
     content = response.content[0]
@@ -41,29 +47,30 @@ async def get_qrcode_and_wait(session):
     elif hasattr(content, "data"):
         qr_data = content.data
     else:
-        print(f"Unknown content type: {type(content)}")
+        logger.warning(f"Unknown content type: {type(content)}")
         return
 
     if qr_data == "ALREADY_LOGGED_IN":
-        print("Already logged in.")
+        logger.info("Already logged in.")
         return
 
     try:
         qr_bytes = base64.b64decode(qr_data)
         with open("qrcode.png", "wb") as f:
             f.write(qr_bytes)
-        print("Saved QR code to 'qrcode.png'. Please open it and scan with WeChat.")
+        logger.info("Saved QR code to 'qrcode.png'. Please open it and scan with WeChat.")
     except Exception as e:
-        print(f"Failed to save QR code image: {e}")
+        logger.error(f"Failed to save QR code image: {e}")
         return
 
-    print("Waiting for login...", end="", flush=True)
+        return
+
+    logger.info("Waiting for login...")
     while True:
         await asyncio.sleep(5)
         if await check_login(session):
-            print("\nSuccessfully logged in!")
+            logger.info("Successfully logged in!")
             break
-        print(".", end="", flush=True)
 
 
 async def search_articles(session, account_name, count=10):
@@ -82,13 +89,13 @@ async def search_articles(session, account_name, count=10):
         except json.JSONDecodeError:
             return [{"title": "Raw Results", "url": "", "raw": text_content}]
     except Exception as e:
-        print(f"Error searching articles for {account_name}: {e}")
+        logger.error(f"Error searching articles for {account_name}: {e}")
         return []
 
 
 def load_accounts():
     if not os.path.exists(ACCOUNTS_FILE):
-        print(f"Please create '{ACCOUNTS_FILE}' with one account name per line.")
+        logger.warning(f"Please create '{ACCOUNTS_FILE}' with one account name per line.")
         return []
 
     with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
@@ -119,7 +126,7 @@ async def fetch_latest_articles():
     """Fetch new articles from MCP Server."""
     accounts = load_accounts()
     if not accounts:
-        print("[Tracker] No accounts configured.")
+        logger.warning("No accounts configured.")
         return
 
     history = load_history()
@@ -127,7 +134,7 @@ async def fetch_latest_articles():
     daily_results = {}
 
     os.makedirs(DAILY_FOLDER, exist_ok=True)
-    print(f"\n[Tracker] Connecting to WeChat MCP Server at {MCP_SERVER_URL} ...")
+    logger.info(f"Connecting to WeChat MCP Server at {MCP_SERVER_URL} ...")
 
     try:
         async with sse_client(MCP_SERVER_URL) as streams:
@@ -138,10 +145,10 @@ async def fetch_latest_articles():
                 if not logged_in:
                     await get_qrcode_and_wait(session)
 
-                print(f"[Tracker] Starting tracking for {len(accounts)} accounts...")
+                logger.info(f"Starting tracking for {len(accounts)} accounts...")
 
                 for i, account in enumerate(accounts, 1):
-                    print(f"[Tracker] [{i}/{len(accounts)}] Fetching '{account}'...")
+                    logger.info(f"[{i}/{len(accounts)}] Fetching '{account}'...")
                     # For continuous monitoring, we request a limited number of articles (e.g., 10)
                     articles = await search_articles(session, account, count=10)
 
@@ -173,25 +180,25 @@ async def fetch_latest_articles():
                             )
 
                     if new_articles:
-                        print(f"  -> Found {len(new_articles)} new articles!")
+                        logger.info(f"  -> Found {len(new_articles)} new articles!")
                         daily_results[account] = new_articles
                     else:
-                        print(f"  -> No new articles found.")
+                        logger.info(f"  -> No new articles found.")
 
                     save_history(history)
 
                     if i < len(accounts):
-                        print("  Waiting 10 seconds before next account...")
+                        logger.info("  Waiting 10 seconds before next account...")
                         await asyncio.sleep(10)
     except Exception as e:
-        print(f"[Tracker] Error during article fetch: {e}")
+        logger.error(f"Error during article fetch: {e}")
 
     # Save daily report
     if daily_results:
         report_path = os.path.join(DAILY_FOLDER, f"report_{today_str}.json")
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(daily_results, f, ensure_ascii=False, indent=2)
-        print(f"[Tracker] Saved daily report to: {report_path}")
+        logger.info(f"Saved daily report to: {report_path}")
 
 
 async def download_missing_pdfs():
@@ -221,16 +228,16 @@ async def download_missing_pdfs():
                     tasks.append((account, article, account_dir))
 
     if not tasks:
-        print("[PDF] No missing PDFs to download.")
+        logger.info("No missing PDFs to download.")
         return
 
-    print(f"\n[PDF] Found {len(tasks)} missing articles. Starting Playwright export...")
+    logger.info(f"Found {len(tasks)} missing articles. Starting Playwright export...")
 
     try:
         ws_endpoint = os.getenv("PLAYWRIGHT_WS_ENDPOINT")
         async with async_playwright() as p:
             if ws_endpoint:
-                print(f"[PDF Worker] Connecting to remote browser at {ws_endpoint}")
+                logger.info(f"Connecting to remote browser at {ws_endpoint}")
                 browser = await p.chromium.connect(ws_endpoint)
             else:
                 browser = await p.chromium.launch(headless=True)
@@ -242,7 +249,7 @@ async def download_missing_pdfs():
                 url = article.get("url")
                 title = article.get("title", "Untitled")
                 safe_title = sanitize_filename(title) or "Untitled"
-                print(f"[PDF Worker] Loading: {title} ...")
+                logger.info(f"Loading: {title} ...")
                 try:
                     await page.goto(url, wait_until="networkidle", timeout=30000)
 
@@ -258,7 +265,7 @@ async def download_missing_pdfs():
 
                     pdf_path = os.path.join(account_dir, f"[{date_str}] {safe_title}.pdf")
                     filename = os.path.basename(pdf_path)
-                    print(f"[PDF Worker] Exporting: {filename} ...")
+                    logger.info(f"Exporting: {filename} ...")
 
                     # Scroll through the page progressively to trigger all lazy-loaded images
                     await page.evaluate(
@@ -286,20 +293,18 @@ async def download_missing_pdfs():
                     await page.wait_for_timeout(6000)
 
                     await page.pdf(path=pdf_path, format="A4")
-                    print(f"[PDF Worker]   -> Saved to {pdf_path}")
+                    logger.info(f"  -> Saved to {pdf_path}")
                 except Exception as e:
-                    print(f"[PDF Worker]   -> Error exporting: {e}")
+                    logger.error(f"  -> Error exporting: {e}")
 
             await browser.close()
     except Exception as e:
-        print(f"[PDF] Playwright error: {e}")
+        logger.error(f"Playwright error: {e}")
 
 
 async def scheduled_job():
     """The main routine that runs on the configured schedule."""
-    print(
-        f"\n{'='*60}\n>>> STARTING SCHEDULED JOB AT {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} <<<\n{'='*60}"
-    )
+    logger.info(">>> STARTING SCHEDULED JOB <<<")
 
     # 1. Fetch new articles
     await fetch_latest_articles()
@@ -307,13 +312,11 @@ async def scheduled_job():
     # 2. Download any new or historically missing PDFs
     await download_missing_pdfs()
 
-    print(
-        f"\n{'='*60}\n<<< FINISHED SCHEDULED JOB AT {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} >>>\n{'='*60}"
-    )
+    logger.info("<<< FINISHED SCHEDULED JOB >>>")
 
 
 async def main():
-    print("Initializing APScheduler...")
+    logger.info("Initializing APScheduler...")
     scheduler = AsyncIOScheduler()
 
     # Schedule the job to run every hour
@@ -323,14 +326,14 @@ async def main():
     # Run the first job immediately
     await scheduled_job()
 
-    print("\nScheduler is active. Press Ctrl+C to exit.")
+    logger.info("Scheduler is active. Press Ctrl+C to exit.")
 
     try:
         # Keep the main async loop running
         while True:
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, SystemExit):
-        print("Shutting down scheduler...")
+        logger.info("Shutting down scheduler...")
 
 
 if __name__ == "__main__":
