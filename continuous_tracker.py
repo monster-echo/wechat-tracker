@@ -257,6 +257,13 @@ async def pdf_worker():
 
         try:
             ws_endpoint = PLAYWRIGHT_WS_ENDPOINT
+            if ws_endpoint:
+                # Add stealth and automation hiding flags to the Browserless connection
+                if "?" in ws_endpoint:
+                    ws_endpoint += "&stealth&--disable-blink-features=AutomationControlled"
+                else:
+                    ws_endpoint += "?stealth&--disable-blink-features=AutomationControlled"
+
             async with async_playwright() as p:
                 if ws_endpoint:
                     logger.info(f"Connecting to remote browser at {ws_endpoint}")
@@ -264,7 +271,14 @@ async def pdf_worker():
                 else:
                     browser = await p.chromium.launch(headless=True)
                 
-                context = await browser.new_context()
+                # Simulate a realistic iOS mobile browser to avoid anti-bot detection
+                context = await browser.new_context(
+                    user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/104.1",
+                    viewport={"width": 375, "height": 667},
+                    device_scale_factor=2,
+                    is_mobile=True,
+                    has_touch=True
+                )
                 page = await context.new_page()
 
                 # Process the first task we got, and any others that arrive while the browser is open
