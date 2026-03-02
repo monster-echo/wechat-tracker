@@ -263,6 +263,7 @@ async def pdf_worker():
                     browser = await p.chromium.launch(headless=True)
                 
                 context = await browser.new_context()
+                context = await browser.new_context()
                 page = await context.new_page()
 
                 # Process the first task we got, and any others that arrive while the browser is open
@@ -334,12 +335,30 @@ async def pdf_worker():
                             current_task = None
 
                 finally:
-                    await browser.close()
+                    # Clean up the browser context
+                    if page:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+                    try:
+                        await context.close()
+                        await browser.close()
+                    except Exception:
+                        pass
+                    
         except asyncio.CancelledError:
             logger.info("PDF Worker shutting down...")
             break
         except Exception as e:
-            logger.error(f"Playwright error in worker: {e}")
+            logger.error(f"Playwright error in worker (Connection might have dropped): {e}")
+            # Re-queue the article so it doesn't get lost
+            if 'current_task' in locals() and current_task is not None:
+                logger.info("Re-queuing the failed article...")
+                pdf_queue.put_nowait(current_task)
+                
+            # Wait a bit before trying to reconnect to avoid spamming the endpoint if it's down
+            await asyncio.sleep(5)
 
 
 async def scheduled_job():
