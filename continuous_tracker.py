@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 pdf_queue = asyncio.Queue()
 
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000/sse")
+PLAYWRIGHT_WS_ENDPOINT = os.getenv("PLAYWRIGHT_WS_ENDPOINT")
 
 DATA_DIR = "data"
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.txt")
@@ -25,9 +26,10 @@ DAILY_FOLDER = os.path.join(DATA_DIR, "daily_reports")
 PDF_DIR = os.path.join(DATA_DIR, "pdf_exports")
 
 
-def sanitize_filename(filename):
-    """Remove invalid characters for filenames."""
-    return re.sub(r'[\\/*?:"<>|]', "", str(filename)).strip()
+def sanitize_filename(filename, max_length=200):
+    """Remove invalid characters for filenames and truncate to max_length avoid OS errors."""
+    clean_name = re.sub(r'[\\/*?:"<>|]', "", str(filename)).strip()
+    return clean_name[:max_length]
 
 
 async def check_login(session):
@@ -254,15 +256,14 @@ async def pdf_worker():
             break
 
         try:
-            ws_endpoint = os.getenv("PLAYWRIGHT_WS_ENDPOINT")
+            ws_endpoint = PLAYWRIGHT_WS_ENDPOINT
             async with async_playwright() as p:
                 if ws_endpoint:
                     logger.info(f"Connecting to remote browser at {ws_endpoint}")
-                    browser = await p.chromium.connect(ws_endpoint)
+                    browser = await p.chromium.connect_over_cdp(ws_endpoint)
                 else:
                     browser = await p.chromium.launch(headless=True)
                 
-                context = await browser.new_context()
                 context = await browser.new_context()
                 page = await context.new_page()
 
@@ -286,7 +287,7 @@ async def pdf_worker():
                             if publish_time_unix:
                                 try:
                                     from datetime import datetime
-                                    date_str = datetime.fromtimestamp(int(publish_time_unix)).strftime("%Y-%m-%d")
+                                    date_str = datetime.fromtimestamp(int(publish_time_unix)).strftime("%Y%m%d%H%M%S")
                                 except Exception:
                                     date_str = curr_article.get("date") or curr_article.get("date_fetched") or "unknown_date"
                             else:
