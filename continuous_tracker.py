@@ -203,16 +203,21 @@ async def fetch_latest_articles():
                     save_history(history)
 
                     if i < len(accounts):
+                        import random
                         random_delay = random.randint(1, 10)
                         logger.info(f"  Waiting {random_delay} seconds before next account...")
     except Exception as e:
         logger.error(f"Error during article fetch: {type(e).__name__} - {e}")
-        # When connection to SSE fails, anyio raises an ExceptionGroup
-        if hasattr(e, "exceptions"):
-            for idx, sub_exc in enumerate(e.exceptions, 1):
-                logger.error(f"  -> Sub-exception {idx}: {type(sub_exc).__name__} - {sub_exc}")
-        else:
-            logger.debug(traceback.format_exc())
+        def print_exceptions(exc, depth=1):
+            if hasattr(exc, "exceptions"):
+                for idx, sub_exc in enumerate(exc.exceptions, 1):
+                    logger.error(f"{'  ' * depth}-> Sub-exception {idx}: {type(sub_exc).__name__} - {sub_exc}")
+                    print_exceptions(sub_exc, depth + 1)
+            else:
+                import traceback
+                logger.error(f"{'  ' * depth}-> Traceback details:\n{''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))}")
+        
+        print_exceptions(e)
     if daily_results:
         report_path = os.path.join(DAILY_FOLDER, f"report_{today_str}.json")
         with open(report_path, "w", encoding="utf-8") as f:
@@ -375,7 +380,7 @@ async def scheduled_job():
     logger.info(">>> STARTING SCHEDULED JOB <<<")
 
     # 1. Queue historically missing PDFs
-    await enqueue_missing_pdfs()
+    # await enqueue_missing_pdfs()
 
     # 2. Fetch new articles (this will concurrently enqueue PDFs)
     await fetch_latest_articles()
