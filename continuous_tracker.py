@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # Queue for PDF downloading tasks
 pdf_queue = asyncio.Queue()
 
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000/sse")
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://wechat-mcp.f.rwecho.top/sse")
 PLAYWRIGHT_WS_ENDPOINT = os.getenv("PLAYWRIGHT_WS_ENDPOINT")
 
 DATA_DIR = "data"
@@ -267,7 +267,6 @@ async def pdf_worker():
         try:
             ws_endpoint = PLAYWRIGHT_WS_ENDPOINT
             if ws_endpoint:
-                # Add stealth and automation hiding flags to the Browserless connection
                 if "?" in ws_endpoint:
                     ws_endpoint += "&stealth&--disable-blink-features=AutomationControlled"
                 else:
@@ -280,7 +279,6 @@ async def pdf_worker():
                 else:
                     browser = await p.chromium.launch(headless=True)
                 
-                # Simulate a realistic iOS mobile browser to avoid anti-bot detection
                 context = await browser.new_context(
                     user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/104.1",
                     viewport={"width": 375, "height": 667},
@@ -290,76 +288,63 @@ async def pdf_worker():
                 )
                 page = await context.new_page()
 
-                # Process the first task we got, and any others that arrive while the browser is open
-                current_task = (account, article)
                 try:
-                    while current_task is not None:
-                        curr_account, curr_article = current_task
-                        
-                        account_dir = os.path.join(PDF_DIR, sanitize_filename(curr_account))
-                        os.makedirs(account_dir, exist_ok=True)
-                        
-                        url = curr_article.get("url")
-                        title = curr_article.get("title", "Untitled")
-                        safe_title = sanitize_filename(title) or "Untitled"
-                        logger.info(f"Loading: {title} ...")
-                        try:
-                            await page.goto(url, wait_until="networkidle", timeout=30000)
+                    account_dir = os.path.join(PDF_DIR, sanitize_filename(account))
+                    os.makedirs(account_dir, exist_ok=True)
+                    
+                    url = article.get("url")
+                    title = article.get("title", "Untitled")
+                    safe_title = sanitize_filename(title) or "Untitled"
+                    logger.info(f"Loading: {title} ...")
+                    
+                    try:
+                        await page.goto(url, wait_until="networkidle", timeout=30000)
 
-                            publish_time_unix = await page.evaluate("window.ct")
-                            if publish_time_unix:
-                                try:
-                                    from datetime import datetime
-                                    date_str = datetime.fromtimestamp(int(publish_time_unix)).strftime("%Y%m%d%H%M%S")
-                                except Exception:
-                                    date_str = curr_article.get("date") or curr_article.get("date_fetched") or "unknown_date"
-                            else:
-                                date_str = curr_article.get("date") or curr_article.get("date_fetched") or "unknown_date"
+                        publish_time_unix = await page.evaluate("window.ct")
+                        if publish_time_unix:
+                            try:
+                                from datetime import datetime
+                                date_str = datetime.fromtimestamp(int(publish_time_unix)).strftime("%Y%m%d%H%M%S")
+                            except Exception:
+                                date_str = article.get("date") or article.get("date_fetched") or "unknown_date"
+                        else:
+                            date_str = article.get("date") or article.get("date_fetched") or "unknown_date"
 
-                            pdf_path = os.path.join(account_dir, f"[{date_str}] {safe_title}.pdf")
-                            filename = os.path.basename(pdf_path)
-                            logger.info(f"Exporting: {filename} ...")
+                        pdf_path = os.path.join(account_dir, f"[{date_str}] {safe_title}.pdf")
+                        filename = os.path.basename(pdf_path)
+                        logger.info(f"Exporting: {filename} ...")
 
-                            # Scroll through the page progressively to trigger all lazy-loaded images
-                            await page.evaluate(
-                                """
-                                async () => {
-                                    await new Promise((resolve) => {
-                                        let totalHeight = 0;
-                                        const distance = 200;
-                                        const timer = setInterval(() => {
-                                            const scrollHeight = document.body.scrollHeight;
-                                            window.scrollBy(0, distance);
-                                            totalHeight += distance;
-
-                                            if(totalHeight >= scrollHeight - window.innerHeight){
-                                                clearInterval(timer);
-                                                resolve();
-                                            }
-                                        }, 100);
-                                    });
-                                }
+                        await page.evaluate(
                             """
-                            )
+                            async () => {
+                                await new Promise((resolve) => {
+                                    let totalHeight = 0;
+                                    const distance = 200;
+                                    const timer = setInterval(() => {
+                                        const scrollHeight = document.body.scrollHeight;
+                                        window.scrollBy(0, distance);
+                                        totalHeight += distance;
 
-                            # Wait an extra 5~6 seconds for images/scripts to settle
-                            await page.wait_for_timeout(6000)
+                                        if(totalHeight >= scrollHeight - window.innerHeight){
+                                            clearInterval(timer);
+                                            resolve();
+                                        }
+                                    }, 100);
+                                });
+                            }
+                        """
+                        )
 
-                            await page.pdf(path=pdf_path, format="A4")
-                            logger.info(f"  -> Saved to {pdf_path}")
-                        except Exception as e:
-                            logger.error(f"  -> Error exporting: {e}")
-                        finally:
-                            pdf_queue.task_done()
-                            
-                        # Try to get another task without blocking, to reuse the open browser
-                        try:
-                            current_task = pdf_queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            current_task = None
+                        await page.wait_for_timeout(6000)
 
+                        await page.pdf(path=pdf_path, format="A4")
+                        logger.info(f"  -> Saved to {pdf_path}")
+                    except Exception as e:
+                        logger.error(f"  -> Error exporting: {e}")
+                    finally:
+                        pdf_queue.task_done()
                 finally:
-                    # Clean up the browser context
+                    # Clean up the browser context explicitly per task
                     if page:
                         try:
                             await page.close()
