@@ -7,6 +7,7 @@ from datetime import datetime
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 from playwright.async_api import async_playwright
+import traceback
 import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -80,9 +81,11 @@ async def get_qrcode_and_wait(session):
 
 async def search_articles(session, account_name, count=10):
     try:
+        logger.info(f"Calling 'search_wechat_articles' tool for {account_name}...")
         response = await session.call_tool(
             "search_wechat_articles", {"account_name": account_name, "count": count}
         )
+        logger.info(f"Received response from 'search_wechat_articles' for {account_name}")
         text_content = response.content[0].text
         try:
             data = json.loads(text_content)
@@ -144,8 +147,11 @@ async def fetch_latest_articles():
     try:
         async with sse_client(MCP_SERVER_URL) as streams:
             async with ClientSession(streams[0], streams[1]) as session:
+                logger.info("Initializing MCP session...")
                 await session.initialize()
+                logger.info("MCP session initialized successfully.")
 
+                logger.info("Checking login status...")
                 logged_in = await check_login(session)
                 if not logged_in:
                     await get_qrcode_and_wait(session)
@@ -199,11 +205,14 @@ async def fetch_latest_articles():
                     if i < len(accounts):
                         random_delay = random.randint(1, 10)
                         logger.info(f"  Waiting {random_delay} seconds before next account...")
-                        await asyncio.sleep(random_delay) 
     except Exception as e:
-        logger.error(f"Error during article fetch: {e}")
-
-    # Save daily report
+        logger.error(f"Error during article fetch: {type(e).__name__} - {e}")
+        # When connection to SSE fails, anyio raises an ExceptionGroup
+        if hasattr(e, "exceptions"):
+            for idx, sub_exc in enumerate(e.exceptions, 1):
+                logger.error(f"  -> Sub-exception {idx}: {type(sub_exc).__name__} - {sub_exc}")
+        else:
+            logger.debug(traceback.format_exc())
     if daily_results:
         report_path = os.path.join(DAILY_FOLDER, f"report_{today_str}.json")
         with open(report_path, "w", encoding="utf-8") as f:
