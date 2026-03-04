@@ -137,6 +137,7 @@ class WeChatCollector:
 
         history = self.load_history()
         today_str = datetime.now().strftime("%Y-%m-%d")
+        fetch_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         daily_results: Dict[str, List[Dict[str, Any]]] = {}
 
         os.makedirs(self.config.daily_folder, exist_ok=True)
@@ -172,7 +173,7 @@ class WeChatCollector:
                             url = article.get("url", "")
                             if not url or url in known_urls:
                                 continue
-                            article["date_fetched"] = today_str
+                            article["date_fetched"] = fetch_time_str
                             history[account].append(article)
                             new_articles.append(article)
                             await self._dispatch_new_article(account, article)

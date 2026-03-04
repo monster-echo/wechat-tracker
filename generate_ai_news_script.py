@@ -243,7 +243,7 @@ class NewsGenerator:
                 normalized = self.normalize_article(account, item, target_date)
                 if not normalized:
                     continue
-                if normalized["date_fetched"] == target_date:
+                if normalized["date_fetched"].startswith(target_date):
                     records.append(normalized)
         return records
 
@@ -473,7 +473,8 @@ class NewsGenerator:
 
 
     def build_candidate_text(self, records: List[Dict]) -> Tuple[List[Dict], str]:
-        candidates = records[:20]
+        sorted_records = sorted(records, key=lambda x: x.get("date_fetched", ""), reverse=True)
+        candidates = sorted_records[:100]
         lines = []
         for index, article in enumerate(candidates, 1):
             url = article["url"] or "N/A"
