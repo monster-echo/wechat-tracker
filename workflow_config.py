@@ -45,8 +45,8 @@ class TopicGenerationConfig:
     max_items: int = 12
     max_topics: int = 5
     max_candidates: int = 250
-    min_draft_topics: int = 5
-    max_draft_topics: int = 5
+    min_draft_topics: int = 1
+    max_draft_topics: int = 3
     draft_target_words: int = 1600
     min_imageholders: int = 3
     model: str = "deepseek-chat"
@@ -134,6 +134,8 @@ def load_app_config() -> AppConfig:
         model=model,
         api_base=api_base,
         api_key=api_key,
+        min_draft_topics=env_int("NEWS_MIN_TOPICS", 1),
+        max_draft_topics=env_int("NEWS_MAX_TOPICS", 1),
     )
 
     media_generation = MediaGenerationConfig(
