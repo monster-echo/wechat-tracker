@@ -1,416 +1,95 @@
 import asyncio
-import base64
-import json
-import os
-import re
-from datetime import datetime
-from mcp import ClientSession
-from mcp.client.sse import sse_client
-from playwright.async_api import async_playwright
-import traceback
 import logging
+from datetime import datetime, timedelta
+from typing import Any, Dict
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+from content_workflow import DailyContentPipeline, MediaComposer, TopicDraftWriter
+from pdf_archive_worker import PdfArchiveWorker
+from wechat_collector import WeChatCollector
+from workflow_config import AppConfig, load_app_config
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-# Queue for PDF downloading tasks
-pdf_queue = asyncio.Queue()
 
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://wechat-mcp.f.rwecho.top/sse")
-PLAYWRIGHT_WS_ENDPOINT = os.getenv("PLAYWRIGHT_WS_ENDPOINT")
+class WeChatContentScheduler:
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.scheduler = AsyncIOScheduler()
+        self._content_lock = asyncio.Lock()
 
-DATA_DIR = "data"
-ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.txt")
-HISTORY_FILE = os.path.join(DATA_DIR, "articles_history.json")
-DAILY_FOLDER = os.path.join(DATA_DIR, "daily_reports")
-PDF_DIR = os.path.join(DATA_DIR, "pdf_exports")
-
-
-def sanitize_filename(filename, max_length=200):
-    """Remove invalid characters for filenames and truncate to max_length avoid OS errors."""
-    clean_name = re.sub(r'[\\/*?:"<>|]', "", str(filename)).strip()
-    return clean_name[:max_length]
-
-
-async def check_login(session):
-    try:
-        response = await session.call_tool("check_login_status", {})
-        status = response.content[0].text
-        return status == "LOGGED_IN"
-    except Exception as e:
-        logger.error(f"Error checking login status: {e}")
-        return False
-
-
-async def get_qrcode_and_wait(session):
-    logger.info("Not logged in. Fetching login QR code...")
-    response = await session.call_tool("get_login_qrcode", {})
-
-    content = response.content[0]
-    if hasattr(content, "text"):
-        qr_data = content.text
-    elif hasattr(content, "data"):
-        qr_data = content.data
-    else:
-        logger.warning(f"Unknown content type: {type(content)}")
-        return
-
-    if qr_data == "ALREADY_LOGGED_IN":
-        logger.info("Already logged in.")
-        return
-
-    try:
-        qr_bytes = base64.b64decode(qr_data)
-        with open("qrcode.png", "wb") as f:
-            f.write(qr_bytes)
-        logger.info("Saved QR code to 'qrcode.png'. Please open it and scan with WeChat.")
-    except Exception as e:
-        logger.error(f"Failed to save QR code image: {e}")
-        return
-
-        return
-
-    logger.info("Waiting for login...")
-    while True:
-        await asyncio.sleep(5)
-        if await check_login(session):
-            logger.info("Successfully logged in!")
-            break
-
-
-async def search_articles(session, account_name, count=10):
-    try:
-        logger.info(f"Calling 'search_wechat_articles' tool for {account_name}...")
-        response = await session.call_tool(
-            "search_wechat_articles", {"account_name": account_name, "count": count}
+        self.pdf_worker = PdfArchiveWorker(config.pdf)
+        self.collector = WeChatCollector(
+            config=config.collector,
+            on_new_article=self._on_new_article,
         )
-        logger.info(f"Received response from 'search_wechat_articles' for {account_name}")
-        text_content = response.content[0].text
-        try:
-            data = json.loads(text_content)
-            if isinstance(data, dict) and "articles" in data:
-                return data["articles"]
-            if isinstance(data, list):
-                return data
-            return []
-        except json.JSONDecodeError:
-            return [{"title": "Raw Results", "url": "", "raw": text_content}]
-    except Exception as e:
-        logger.error(f"Error searching articles for {account_name}: {e}")
-        return []
+        self.content_pipeline = DailyContentPipeline(
+            topic_writer=TopicDraftWriter(config.topic_generation),
+            media_composer=MediaComposer(config.media_generation),
+        )
 
+    async def _on_new_article(self, account: str, article: dict) -> None:
+        await self.pdf_worker.enqueue(account, article)
 
-def load_accounts():
-    if not os.path.exists(ACCOUNTS_FILE):
-        logger.warning(f"Please create '{ACCOUNTS_FILE}' with one account name per line.")
-        return []
+    async def run_routine(self) -> None:
+        logger.info(">>> 开始爬取文章 <<<")
+        fetch_res = await self.collector.fetch_latest_articles()
+        logger.info("<<< 爬取文章结束 >>> new_count=%s", fetch_res.get("new_count", 0))
 
-    with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-        accounts = [
-            line.strip()
-            for line in f
-            if line.strip() and not line.strip().startswith("#")
-        ]
-    return accounts
+        if self._content_lock.locked():
+            logger.info("生成任务正在执行，跳过本次触发")
+            return
 
+        async with self._content_lock:
+            target_date = datetime.now().strftime("%Y-%m-%d")
+            logger.info(">>> 开始选话题与编写文章 <<< date=%s", target_date)
+            res = await self.content_pipeline.run(target_date)
+            draft_count = len((res or {}).get("draft_files", []) or [])
+            logger.info("<<< 选话题与编写文章结束 >>> draft_count=%s", draft_count)
 
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            try:
-                return json.load(f)
-            except:
-                return {}
-    return {}
+    def register_jobs(self) -> None:
+        fetch_interval_hours = max(self.config.scheduler.fetch_interval_hours, 1)
+        self.scheduler.add_job(
+            self.run_routine,
+            "interval",
+            hours=fetch_interval_hours,
+            id="wechat_tracker_routine",
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info("定时任务已注册：每 %s 小时执行一次 (爬文章->选话题->写文章)", fetch_interval_hours)
 
-
-def save_history(history):
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
-
-
-async def fetch_latest_articles():
-    """Fetch new articles from MCP Server."""
-    accounts = load_accounts()
-    if not accounts:
-        logger.warning("No accounts configured.")
-        return
-
-    history = load_history()
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    daily_results = {}
-
-    os.makedirs(DAILY_FOLDER, exist_ok=True)
-    logger.info(f"Connecting to WeChat MCP Server at {MCP_SERVER_URL} ...")
-
-    try:
-        async with sse_client(MCP_SERVER_URL) as streams:
-            async with ClientSession(streams[0], streams[1]) as session:
-                logger.info("Initializing MCP session...")
-                await session.initialize()
-                logger.info("MCP session initialized successfully.")
-
-                logger.info("Checking login status...")
-                logged_in = await check_login(session)
-                if not logged_in:
-                    await get_qrcode_and_wait(session)
-
-                logger.info(f"Starting tracking for {len(accounts)} accounts...")
-
-                for i, account in enumerate(accounts, 1):
-                    logger.info(f"[{i}/{len(accounts)}] Fetching '{account}'...")
-                    # For continuous monitoring, we request a limited number of articles (e.g., 10)
-                    articles = await search_articles(session, account, count=10)
-
-                    if account not in history:
-                        history[account] = []
-
-                    known_urls = {
-                        item.get("url", "")
-                        for item in history[account]
-                        if isinstance(item, dict) and item.get("url")
-                    }
-
-                    new_articles = []
-                    for article in articles:
-                        if isinstance(article, dict):
-                            url = article.get("url", "")
-                            if (url and url not in known_urls) or (
-                                not url and article not in history[account]
-                            ):
-                                article["date_fetched"] = today_str
-                                new_articles.append(article)
-                                history[account].append(article)
-                                
-                                # Immediately push to queue if there is a URL
-                                if url:
-                                    pdf_queue.put_nowait((account, article))
-                        elif isinstance(article, str):
-                            new_articles.append(
-                                {"raw": article, "date_fetched": today_str}
-                            )
-                            history[account].append(
-                                {"raw": article, "date_fetched": today_str}
-                            )
-
-                    if new_articles:
-                        logger.info(f"  -> Found {len(new_articles)} new articles!")
-                        daily_results[account] = new_articles
-                    else:
-                        logger.info(f"  -> No new articles found.")
-
-                    save_history(history)
-
-                    if i < len(accounts):
-                        import random
-                        random_delay = random.randint(1, 10)
-                        logger.info(f"  Waiting {random_delay} seconds before next account...")
-    except Exception as e:
-        logger.error(f"Error during article fetch: {type(e).__name__} - {e}")
-        def print_exceptions(exc, depth=1):
-            if hasattr(exc, "exceptions"):
-                for idx, sub_exc in enumerate(exc.exceptions, 1):
-                    logger.error(f"{'  ' * depth}-> Sub-exception {idx}: {type(sub_exc).__name__} - {sub_exc}")
-                    print_exceptions(sub_exc, depth + 1)
-            else:
-                import traceback
-                logger.error(f"{'  ' * depth}-> Traceback details:\n{''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))}")
-        
-        print_exceptions(e)
-    if daily_results:
-        report_path = os.path.join(DAILY_FOLDER, f"report_{today_str}.json")
-        with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(daily_results, f, ensure_ascii=False, indent=2)
-        logger.info(f"Saved daily report to: {report_path}")
-
-
-async def enqueue_missing_pdfs():
-    """Scan history and queue up all historically missing PDFs."""
-    history = load_history()
-    count = 0
-
-    # Find everything missing a PDF
-    for account, articles in history.items():
-        account_dir = os.path.join(PDF_DIR, sanitize_filename(account))
-        os.makedirs(account_dir, exist_ok=True)
-
-        for article in articles:
-            if isinstance(article, dict) and article.get("url"):
-                title = article.get("title", "Untitled")
-                safe_title = sanitize_filename(title) or "Untitled"
-
-                already_exists = False
-                if os.path.exists(account_dir):
-                    existing_files = os.listdir(account_dir)
-                    for f in existing_files:
-                        if f == f"{safe_title}.pdf" or f.endswith(f"] {safe_title}.pdf"):
-                            already_exists = True
-                            break
-
-                if not already_exists:
-                    pdf_queue.put_nowait((account, article))
-                    count += 1
-
-    if count > 0:
-        logger.info(f"Queued {count} historically missing PDFs for download.")
-    else:
-        logger.info("No historically missing PDFs to download.")
-
-
-async def pdf_worker():
-    """Background worker that consumes the pdf_queue and downloads PDFs."""
-    logger.info("PDF Worker started.")
-
-    while True:
-        try:
-            # Initial wait or re-connect wait
-            account, article = await pdf_queue.get()
-        except asyncio.CancelledError:
-            break
-
-        try:
-            ws_endpoint = PLAYWRIGHT_WS_ENDPOINT
-            if ws_endpoint:
-                if "?" in ws_endpoint:
-                    ws_endpoint += "&stealth&--disable-blink-features=AutomationControlled"
-                else:
-                    ws_endpoint += "?stealth&--disable-blink-features=AutomationControlled"
-
-            async with async_playwright() as p:
-                if ws_endpoint:
-                    logger.info(f"Connecting to remote browser at {ws_endpoint}")
-                    browser = await p.chromium.connect_over_cdp(ws_endpoint)
-                else:
-                    browser = await p.chromium.launch(headless=True)
-                
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/104.1",
-                    viewport={"width": 375, "height": 667},
-                    device_scale_factor=2,
-                    is_mobile=True,
-                    has_touch=True
-                )
-                page = await context.new_page()
-
-                try:
-                    account_dir = os.path.join(PDF_DIR, sanitize_filename(account))
-                    os.makedirs(account_dir, exist_ok=True)
-                    
-                    url = article.get("url")
-                    title = article.get("title", "Untitled")
-                    safe_title = sanitize_filename(title) or "Untitled"
-                    logger.info(f"Loading: {title} ...")
-                    
-                    try:
-                        await page.goto(url, wait_until="networkidle", timeout=30000)
-
-                        publish_time_unix = await page.evaluate("window.ct")
-                        if publish_time_unix:
-                            try:
-                                from datetime import datetime
-                                date_str = datetime.fromtimestamp(int(publish_time_unix)).strftime("%Y%m%d%H%M%S")
-                            except Exception:
-                                date_str = article.get("date") or article.get("date_fetched") or "unknown_date"
-                        else:
-                            date_str = article.get("date") or article.get("date_fetched") or "unknown_date"
-
-                        pdf_path = os.path.join(account_dir, f"[{date_str}] {safe_title}.pdf")
-                        filename = os.path.basename(pdf_path)
-                        logger.info(f"Exporting: {filename} ...")
-
-                        await page.evaluate(
-                            """
-                            async () => {
-                                await new Promise((resolve) => {
-                                    let totalHeight = 0;
-                                    const distance = 200;
-                                    const timer = setInterval(() => {
-                                        const scrollHeight = document.body.scrollHeight;
-                                        window.scrollBy(0, distance);
-                                        totalHeight += distance;
-
-                                        if(totalHeight >= scrollHeight - window.innerHeight){
-                                            clearInterval(timer);
-                                            resolve();
-                                        }
-                                    }, 100);
-                                });
-                            }
-                        """
-                        )
-
-                        await page.wait_for_timeout(6000)
-
-                        await page.pdf(path=pdf_path, format="A4")
-                        logger.info(f"  -> Saved to {pdf_path}")
-                    except Exception as e:
-                        logger.error(f"  -> Error exporting: {e}")
-                    finally:
-                        pdf_queue.task_done()
-                finally:
-                    # Clean up the browser context explicitly per task
-                    if page:
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-                    try:
-                        await context.close()
-                        await browser.close()
-                    except Exception:
-                        pass
-                    
-        except asyncio.CancelledError:
-            logger.info("PDF Worker shutting down...")
-            break
-        except Exception as e:
-            logger.error(f"Playwright error in worker (Connection might have dropped): {e}")
-            # Re-queue the article so it doesn't get lost
-            if 'current_task' in locals() and current_task is not None:
-                logger.info("Re-queuing the failed article...")
-                pdf_queue.put_nowait(current_task)
-                
-            # Wait a bit before trying to reconnect to avoid spamming the endpoint if it's down
-            await asyncio.sleep(5)
-
-
-async def scheduled_job():
-    """The main routine that runs on the configured schedule."""
-    logger.info(">>> STARTING SCHEDULED JOB <<<")
-
-    # 1. Queue historically missing PDFs
-    # await enqueue_missing_pdfs()
-
-    # 2. Fetch new articles (this will concurrently enqueue PDFs)
-    await fetch_latest_articles()
-
-    logger.info("<<< FINISHED SCHEDULED JOB >>>")
-
-
-async def main():
-    logger.info("Initializing APScheduler...")
-    scheduler = AsyncIOScheduler()
-
-    # Start the background worker for downloading PDFs
-    worker_task = asyncio.create_task(pdf_worker())
-
-    # Schedule the job to run every hour
-    scheduler.add_job(scheduled_job, "interval", hours=1)
-    scheduler.start()
-
-    # Run the first job immediately
-    await scheduled_job()
-
-    logger.info("Scheduler and global PDF worker are active. Press Ctrl+C to exit.")
-
-    try:
-        # Keep the main async loop running
+    async def start(self) -> None:
+        logger.info("初始化调度器...")
+        self.pdf_worker.start()
+        self.register_jobs()
+        self.scheduler.start()
+        await self.run_routine()
+        logger.info("系统运行中，按 Ctrl+C 停止。")
         while True:
             await asyncio.sleep(3600)
+
+    async def shutdown(self) -> None:
+        logger.info("准备关闭调度器与后台任务...")
+        try:
+            self.scheduler.shutdown(wait=False)
+        except Exception:
+            pass
+        await self.pdf_worker.stop()
+
+
+async def main() -> None:
+    config = load_app_config()
+    app = WeChatContentScheduler(config)
+    try:
+        await app.start()
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutting down scheduler and workers...")
-        worker_task.cancel()
+        await app.shutdown()
 
 
 if __name__ == "__main__":
