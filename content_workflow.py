@@ -20,36 +20,17 @@ class TopicDraftWriter:
         self.config = config
 
     def _build_news_options(self, date_str: str) -> types.SimpleNamespace:
-        max_topics = max(self.config.max_topics, self.config.min_draft_topics, 1)
-        max_draft_topics = max(
-            self.config.max_draft_topics,
-            self.config.min_draft_topics,
-            0,
-        )
         return _make_namespace(
             date=date_str,
-            source=self.config.source,
-            max_items=self.config.max_items,
-            topic_mode=self.config.topic_mode,
-            max_topics=max_topics,
-            max_candidates=max(self.config.max_candidates, 1),
-            skip_drafts=False,
-            draft_model=self.config.draft_model,
-            draft_dir=self.config.draft_dir,
-            max_draft_topics=max_draft_topics,
-            min_draft_topics=max(self.config.min_draft_topics, 0),
-            draft_target_words=max(self.config.draft_target_words, 600),
-            min_imageholders=max(self.config.min_imageholders, 1),
             model=self.config.model,
             api_base=self.config.api_base,
             api_key=self.config.api_key,
-            no_fallback=self.config.no_fallback,
-            output_md="",
-            output_txt="",
+            draft_target_words=max(self.config.draft_target_words, 600),
+            min_imageholders=max(self.config.min_imageholders, 1),
         )
 
     async def write_daily_articles(self, date_str: str) -> Dict[str, Any]:
-        if self.config.topic_mode == "ai" and not self.config.api_key:
+        if not self.config.api_key:
             logger.error("未配置 AI API Key，跳过成稿生成。")
             return {"success": False, "reason": "missing_api_key", "draft_files": []}
 

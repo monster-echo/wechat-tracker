@@ -154,29 +154,17 @@ AI_STYLE_BANNED_PHRASES = [
 
 class NewsGenerator:
     def __init__(self, args) -> None:
-        """Initialise NewsGenerator from a runtime-options object (argparse.Namespace
-        or a compatible dataclass).  All properties are stored on self so that
-        helper methods do not need to thread `args` through their parameters.
-        """
         self.date: str = args.date
-        self.source: str = args.source
-        self.max_items: int = args.max_items
-        self.topic_mode: str = args.topic_mode
-        self.max_topics: int = args.max_topics
-        self.max_candidates: int = args.max_candidates
-        self.skip_drafts: bool = args.skip_drafts
-        self.draft_model: str = getattr(args, "draft_model", "") or ""
-        self.draft_dir: str = getattr(args, "draft_dir", "") or ""
-        self.max_draft_topics: int = getattr(args, "max_draft_topics", 0) or 0
-        self.min_draft_topics: int = getattr(args, "min_draft_topics", 0) or 0
-        self.draft_target_words: int = getattr(args, "draft_target_words", 1600) or 1600
-        self.min_imageholders: int = getattr(args, "min_imageholders", 3) or 3
         self.model: str = args.model
         self.api_base: str = args.api_base
         self.api_key: str = args.api_key
-        self.no_fallback: bool = getattr(args, "no_fallback", False)
-        self.output_md: str = getattr(args, "output_md", "") or ""
-        self.output_txt: str = getattr(args, "output_txt", "") or ""
+        self.api_key: str = args.api_key
+        self.draft_target_words: int = getattr(args, "draft_target_words", 1600) or 1600
+        self.min_imageholders: int = getattr(args, "min_imageholders", 3) or 3
+
+        self.draft_dir = os.path.join(OUTPUT_DIR, f"topic_drafts_{self.date}")
+        self.output_md = os.path.join(OUTPUT_DIR, f"ai_news_brief_{self.date}.md")
+        self.output_txt = os.path.join(OUTPUT_DIR, f"ai_news_script_{self.date}.txt")
 
     def load_json_file(self, path: str):
         if not os.path.exists(path):
@@ -484,10 +472,9 @@ class NewsGenerator:
 
 
 
-    def build_candidate_text(self, records: List[Dict], max_candidates: int) -> Tuple[List[Dict], str]:
-        candidates = records[:max_candidates]
+    def build_candidate_text(self, records: List[Dict]) -> Tuple[List[Dict], str]:
+        candidates = records[:20]
         lines = []
-
         for index, article in enumerate(candidates, 1):
             url = article["url"] or "N/A"
             lines.append(
@@ -552,8 +539,8 @@ class NewsGenerator:
 
 
 
-    def choose_topics_with_ai(self, records: List[Dict], args, date_str: str) -> Dict[str, Any]:
-        candidates, candidates_text = self.build_candidate_text(records, self.max_candidates)
+    def choose_topics_with_ai(self, records: List[Dict], date_str: str) -> Dict[str, Any]:
+        candidates, candidates_text = self.build_candidate_text(records)
         if not candidates:
             raise ValueError("没有可供 AI 选题的候选文章。")
 
@@ -563,34 +550,45 @@ class NewsGenerator:
             "必须忠于候选列表，不得编造事实。"
         )
 
+        current_hour = datetime.now().hour
+        if current_hour == 20:
+            topic_guideline = (
+                "现在是晚上8点，请挑选并汇总今天多个重点事件，"
+                "生成一篇多维度的综合盘点“AI相关新闻选题”。允许将不同新闻点集合在一篇文章里。"
+            )
+        else:
+            topic_guideline = (
+                "请严格挑选出恰好 1 个最具体、最核心的“AI相关新闻单点选题”。\n"
+                "    【绝对禁止】绝对禁止将多个不同的、无关的新闻事件拼接杂糅成一个大锅饭选题！必须专精于一个具体的单一事件进行深度挖掘！"
+            )
+
         user_prompt = f"""
     日期：{date_str}
-    请从下面候选文章中挑选 3~{max(3, self.max_topics)} 个“AI相关选题”。
-    选题标准：优先关注 AI 产品发布、模型能力升级、产业影响、政策与伦理、商业化落地、AI 对各行业影响。
-    你可以忽略与 AI 无关的文章。
+    {topic_guideline}
+    选题标准：优先关注 AI 产品发布、模型能力升级、产业影响、商业化落地等重大事件。
 
     候选文章列表：
     {candidates_text}
 
-    请严格返回 JSON（不要 markdown，不要代码块），结构如下：
+    请严格返回 JSON（不要 markdown，也不要有 markdown 代码块标记），结构如下：
     {{
-      "opening": "开场白，一句话",
+      "opening": "一句话介绍今天重点",
       "topics": [
         {{
           "topic": "选题标题",
-          "reason": "为什么值得讲（20~60字）",
-          "narrative_angle": "怎么讲这个选题（20~60字）",
-          "article_indexes": [1, 7, 10]
+          "reason": "为什么选这个",
+          "narrative_angle": "撰写角度",
+          "article_indexes": [1, 2]
         }}
       ],
-      "selected_article_indexes": [1, 7, 10, 12],
-      "closing": "结尾一句话"
+      "selected_article_indexes": [1, 2],
+      "closing": "结束语"
     }}
 
     约束：
-    1) article_indexes 与 selected_article_indexes 只能用候选文章编号；
-    2) topics 数量不要超过 {self.max_topics}；
-    3) 若当天几乎没有 AI 相关内容，可返回空 topics 和空 selected_article_indexes，并在 opening 里说明。
+    1) article_indexes 必须使用上方候选列表中对应的编号；
+    2) topics 的数量必须严格为 1；
+    3) 若当天毫无任何 AI 价值内容，可返回空 topics。
     """.strip()
 
         content = self.call_chat_completion(
@@ -612,7 +610,7 @@ class NewsGenerator:
         topics = []
         raw_topics = parsed.get("topics", [])
         if isinstance(raw_topics, list):
-            for raw_topic in raw_topics[: self.max_topics]:
+            for raw_topic in raw_topics[:1]:
                 if not isinstance(raw_topic, dict):
                     continue
 
@@ -820,7 +818,6 @@ class NewsGenerator:
     def polish_article_style(self, 
         markdown_text: str,
         topic_name: str,
-        args,
         draft_model: str,
         blocked_sources: List[str],
     ) -> str:
@@ -901,7 +898,6 @@ class NewsGenerator:
     def generate_topic_article_markdown(self, 
         date_str: str,
         topic: Dict[str, Any],
-        args,
         draft_model: str,
     ) -> str:
         topic_name = self.safe_text(topic.get("topic")) or "未命名选题"
@@ -973,7 +969,6 @@ class NewsGenerator:
                 polished = self.polish_article_style(
                     markdown_text=markdown,
                     topic_name=topic_name,
-                    args=args,
                     draft_model=draft_model,
                     blocked_sources=blocked_sources,
                 )
@@ -988,40 +983,31 @@ class NewsGenerator:
     def generate_topic_drafts(self, 
         date_str: str,
         ai_plan: Dict[str, Any],
-        args,
     ) -> List[str]:
         topics = ai_plan.get("topics", [])
         if not topics:
             logger.info("没有可生成成稿的选题，跳过成稿步骤。")
             return []
 
-        max_topics = max(
-            int(getattr(self, "max_draft_topics", 0) or 0),
-            int(getattr(self, "min_draft_topics", 0) or 0),
-            0,
-        )
-        draft_topics = topics[:max_topics]
+        draft_topics = topics[:1]
         if not draft_topics:
             logger.info("max_draft_topics=0，跳过成稿步骤。")
             return []
 
-        draft_dir = self.draft_dir or os.path.join(OUTPUT_DIR, f"topic_drafts_{date_str}")
-        os.makedirs(draft_dir, exist_ok=True)
-        draft_model = self.draft_model or self.model
+        os.makedirs(self.draft_dir, exist_ok=True)
 
         generated_files = []
         total_count = len(draft_topics)
         for index, topic in enumerate(draft_topics, 1):
             topic_name = self.safe_text(topic.get("topic")) or f"选题{index}"
             file_name = f"{index:02d}_{self.sanitize_filename(topic_name)}.md"
-            file_path = os.path.join(draft_dir, file_name)
+            file_path = os.path.join(self.draft_dir, file_name)
 
             logger.info("正在生成选题成稿 [%s/%s]：%s", index, total_count, topic_name)
             article_markdown = self.generate_topic_article_markdown(
                 date_str=date_str,
                 topic=topic,
-                args=args,
-                draft_model=draft_model,
+                draft_model=self.model,
             )
 
             with open(file_path, "w", encoding="utf-8") as file:
@@ -1143,132 +1129,53 @@ class NewsGenerator:
 
 
     def run_news_generation(self) -> Dict[str, Any]:
-
-        records, source_name = self.collect_articles(self.date, self.source)
-        if not records:
-            logger.warning(
-                "未找到 %s 的可用文章数据。请先运行抓取脚本或检查数据文件。", self.date
-            )
-            return {
-                "success": False,
-                "reason": "no_records",
-                "date": self.date,
-                "draft_files": [],
-            }
-
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        output_md = self.output_md or os.path.join(
-            OUTPUT_DIR, f"ai_news_brief_{self.date}.md"
-        )
-        output_txt = self.output_txt or os.path.join(
-            OUTPUT_DIR, f"ai_news_script_{self.date}.txt"
-        )
+        
+        history_data = self.load_json_file(HISTORY_FILE)
+        records = self.deduplicate_articles(self.parse_history(history_data or {}, self.date))
+        source_name = HISTORY_FILE
 
-        mode_used = self.topic_mode
+        if not records:
+            logger.warning("未找到 %s 的可用文章数据。", self.date)
+            return {"success": False, "reason": "no_records", "date": self.date, "draft_files": []}
+
         draft_files: List[str] = []
-        if self.topic_mode == "ai":
-            try:
-                ai_plan = self.choose_topics_with_ai(records, args, self.date)
-                ai_plan = self.ensure_minimum_ai_topics(
-                    ai_plan=ai_plan,
-                    records=records,
-                    min_topics=getattr(self, "min_draft_topics", 0),
-                )
-                if not self.skip_drafts:
-                    draft_files = self.generate_topic_drafts(self.date, ai_plan, args)
-
-                broadcast_script = self.build_ai_broadcast_script(self.date, ai_plan, self.max_items)
-                markdown_report = self.build_ai_markdown_report(
-                    date_str=self.date,
-                    source_name=source_name,
-                    records=records,
-                    ai_plan=ai_plan,
-                    max_items=self.max_items,
-                    draft_files=draft_files,
-                )
-                total_selected = len(ai_plan.get("selected_articles", []))
-                total_topics = len(ai_plan.get("topics", []))
-                stats_line = (
-                    f"统计：总计 {len(records)} 条，AI 输入 {ai_plan.get('candidate_count', 0)} 条，"
-                    f"AI选题 {total_topics} 个，入选文章 {total_selected} 条，生成成稿 {len(draft_files)} 篇。"
-                )
-            except Exception as error:
-                if self.no_fallback:
-                    logger.error("AI 选题失败：%s", error)
-                    return {
-                        "success": False,
-                        "reason": "ai_selection_failed",
-                        "error": self.safe_text(error),
-                        "date": self.date,
-                        "draft_files": [],
-                    }
-
-                logger.warning("AI 选题失败，自动回退到关键字模式：%s", error)
-                mode_used = "keyword-fallback"
-
-                ai_related, news_related, ai_news, ai_only, news_only = self.build_keyword_selection(
-                    records
-                )
-                broadcast_script = self.build_keyword_broadcast_script(
-                    date_str=self.date,
-                    total_count=len(records),
-                    news_count=len(news_related),
-                    ai_count=len(ai_related),
-                    ai_news=ai_news,
-                    ai_only=ai_only,
-                    news_only=news_only,
-                    max_items=self.max_items,
-                )
-                markdown_report = self.build_keyword_markdown_report(
-                    date_str=self.date,
-                    source_name=source_name,
-                    records=records,
-                    ai_news=ai_news,
-                    ai_only=ai_only,
-                    news_only=news_only,
-                    max_items=self.max_items,
-                    broadcast_script=broadcast_script,
-                )
-                stats_line = (
-                    "统计："
-                    f"总计 {len(records)} 条，新闻 {len(news_related)} 条，AI {len(ai_related)} 条，交叉 {len(ai_news)} 条。"
-                )
-        else:
-            ai_related, news_related, ai_news, ai_only, news_only = self.build_keyword_selection(records)
-            broadcast_script = self.build_keyword_broadcast_script(
-                date_str=self.date,
-                total_count=len(records),
-                news_count=len(news_related),
-                ai_count=len(ai_related),
-                ai_news=ai_news,
-                ai_only=ai_only,
-                news_only=news_only,
-                max_items=self.max_items,
+        try:
+            ai_plan = self.choose_topics_with_ai(records, self.date)
+            ai_plan = self.ensure_minimum_ai_topics(
+                ai_plan=ai_plan,
+                records=records,
+                min_topics=1,
             )
-            markdown_report = self.build_keyword_markdown_report(
+            draft_files = self.generate_topic_drafts(self.date, ai_plan)
+
+            broadcast_script = self.build_ai_broadcast_script(self.date, ai_plan, 12)
+            markdown_report = self.build_ai_markdown_report(
                 date_str=self.date,
                 source_name=source_name,
                 records=records,
-                ai_news=ai_news,
-                ai_only=ai_only,
-                news_only=news_only,
-                max_items=self.max_items,
-                broadcast_script=broadcast_script,
+                ai_plan=ai_plan,
+                max_items=12,
+                draft_files=draft_files,
             )
+            total_selected = len(ai_plan.get("selected_articles", []))
+            total_topics = len(ai_plan.get("topics", []))
             stats_line = (
-                "统计："
-                f"总计 {len(records)} 条，新闻 {len(news_related)} 条，AI {len(ai_related)} 条，交叉 {len(ai_news)} 条。"
+                f"统计：总计 {len(records)} 条，AI 输入 {ai_plan.get('candidate_count', 0)} 条，"
+                f"AI选题 {total_topics} 个，入选文章 {total_selected} 条，生成成稿 {len(draft_files)} 篇。"
             )
+        except Exception as error:
+            logger.error("AI 选题失败：%s", error)
+            raise error
 
-        with open(output_md, "w", encoding="utf-8") as file:
+        with open(self.output_md, "w", encoding="utf-8") as file:
             file.write(markdown_report)
 
-        with open(output_txt, "w", encoding="utf-8") as file:
+        with open(self.output_txt, "w", encoding="utf-8") as file:
             file.write(broadcast_script + "\n")
 
-        logger.info("已生成 Markdown 提取稿：%s", output_md)
-        logger.info("已生成文字稿：%s", output_txt)
-        logger.info("模式：%s", mode_used)
+        logger.info("已生成 Markdown 提取稿：%s", self.output_md)
+        logger.info("已生成文字稿：%s", self.output_txt)
         logger.info(stats_line)
         if draft_files:
             logger.info("选题成稿目录：%s", os.path.dirname(draft_files[0]))
@@ -1277,10 +1184,10 @@ class NewsGenerator:
             "success": True,
             "reason": "ok",
             "date": self.date,
-            "mode": mode_used,
+            "mode": "ai",
             "records_count": len(records),
-            "output_md": output_md,
-            "output_txt": output_txt,
+            "output_md": self.output_md,
+            "output_txt": self.output_txt,
             "draft_files": draft_files,
             "draft_dir": os.path.dirname(draft_files[0]) if draft_files else "",
         }
@@ -1295,7 +1202,7 @@ def run_news_generation(args) -> dict:
 def parse_args():
     today_str = datetime.now().strftime("%Y-%m-%d")
     parser = argparse.ArgumentParser(
-        description="根据当天微信公众号抓取结果，提取新闻和AI内容并生成文字稿。"
+        description="根据当天微信公众号抓取结果，提取新闻和AI内容并生成文字稿（精简版）。"
     )
     parser.add_argument(
         "--date",
@@ -1303,107 +1210,21 @@ def parse_args():
         help=f"目标日期，格式 YYYY-MM-DD，默认今天（{today_str}）。",
     )
     parser.add_argument(
-        "--source",
-        choices=["auto", "report", "history"],
-        default="auto",
-        help="数据源：优先 report（当天报告）、history（历史库）或 auto（默认，先 report 再 history）。",
-    )
-    parser.add_argument(
-        "--max-items",
-        type=int,
-        default=12,
-        help="每个分组最多写入的条目数，默认 12。",
-    )
-    parser.add_argument(
-        "--topic-mode",
-        choices=["ai", "keyword"],
-        default="ai",
-        help="选题模式：ai（默认，调用大模型选题）或 keyword（关键字规则）。",
-    )
-    parser.add_argument(
-        "--max-topics",
-        type=int,
-        default=5,
-        help="AI 模式下最多选题数，默认 5。",
-    )
-    parser.add_argument(
-        "--max-candidates",
-        type=int,
-        default=250,
-        help="AI 模式下传给模型的候选文章上限，默认 250。",
-    )
-    parser.add_argument(
-        "--skip-drafts",
-        action="store_true",
-        help="仅做选题，不自动生成每个选题的成稿。",
-    )
-    parser.add_argument(
-        "--draft-model",
-        default="",
-        help="成稿模型名（默认与 --model 相同）。",
-    )
-    parser.add_argument(
-        "--draft-dir",
-        default="",
-        help="成稿输出目录（默认 data/news_scripts/topic_drafts_YYYY-MM-DD）。",
-    )
-    parser.add_argument(
-        "--max-draft-topics",
-        type=int,
-        default=5,
-        help="最多生成多少篇选题成稿，默认 5。",
-    )
-    parser.add_argument(
-        "--min-draft-topics",
-        type=int,
-        default=5,
-        help="至少生成多少篇选题成稿，默认 5（会在 AI 选题不足时自动补位）。",
-    )
-    parser.add_argument(
-        "--draft-target-words",
-        type=int,
-        default=1600,
-        help="每篇成稿目标字数，默认 1600。",
-    )
-    parser.add_argument(
-        "--min-imageholders",
-        type=int,
-        default=3,
-        help="每篇文章至少包含多少个 IMAGEHOLDER，默认 3。",
-    )
-    parser.add_argument(
         "--model",
         default=DEFAULT_LLM_MODEL,
-        help=f"AI 模型名，默认 {DEFAULT_LLM_MODEL}（可被 LLM_MODEL/DEEPSEEK_MODEL/OPENAI_MODEL 覆盖）。",
+        help=f"AI 模型名，默认 {DEFAULT_LLM_MODEL}。",
     )
     parser.add_argument(
         "--api-base",
         default=DEFAULT_LLM_BASE_URL,
-        help=f"模型 API Base URL，默认 {DEFAULT_LLM_BASE_URL}（可被 LLM_API_BASE/DEEPSEEK_BASE_URL/OPENAI_BASE_URL 覆盖）。",
+        help=f"模型 API Base URL，默认 {DEFAULT_LLM_BASE_URL}。",
     )
     parser.add_argument(
         "--api-key",
         default=DEFAULT_LLM_API_KEY,
-        help="模型 API Key（默认读取 LLM_API_KEY/DEEPSEEK_API_KEY/OPENAI_API_KEY）。",
-    )
-    parser.add_argument(
-        "--no-fallback",
-        action="store_true",
-        help="AI 模式失败时不回退到关键字模式。",
-    )
-    parser.add_argument(
-        "--output-md",
-        default="",
-        help="输出 Markdown 路径（默认 data/news_scripts/ai_news_brief_YYYY-MM-DD.md）。",
-    )
-    parser.add_argument(
-        "--output-txt",
-        default="",
-        help="输出文字稿路径（默认 data/news_scripts/ai_news_script_YYYY-MM-DD.txt）。",
+        help="模型 API Key。",
     )
     return parser.parse_args()
-
-
 def main():
     args = parse_args()
     run_news_generation(args)

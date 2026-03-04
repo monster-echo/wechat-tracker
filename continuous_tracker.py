@@ -63,15 +63,17 @@ class WeChatContentScheduler:
             max_instances=1,
             coalesce=True,
         )
+
+        content_hours = "6,7,10,12,16,20"
         self.scheduler.add_job(
             self.run_content_job,
-            "interval",
-            hours=fetch_interval_hours,
+            "cron",
+            hour=content_hours,
             id="wechat_content_job",
             max_instances=1,
             coalesce=True,
         )
-        logger.info("定时任务已注册：每 %s 小时分别独立执行一次抓取和写文章", fetch_interval_hours)
+        logger.info("定时任务已注册：抓取每 %s 小时执行，成稿每天 %s 点执行", fetch_interval_hours, content_hours)
 
     async def start(self) -> None:
         logger.info("初始化调度器...")
