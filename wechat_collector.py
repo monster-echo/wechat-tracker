@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import random
 import logging
 import os
 from datetime import datetime
@@ -117,7 +118,7 @@ class WeChatCollector:
             if isinstance(data, list):
                 return data
         except json.JSONDecodeError:
-            logger.warning("公众号 %s 返回非 JSON，已忽略。", account_name)
+            logger.warning("公众号 %s 返回非 JSON，响应内容：%s", account_name, text_content)
         except Exception as error:
             logger.error("检索公众号失败 [%s]：%s", account_name, error)
         return []
@@ -156,6 +157,9 @@ class WeChatCollector:
                     for index, account in enumerate(accounts, 1):
                         logger.info("[%s/%s] 采集公众号：%s", index, len(accounts), account)
                         articles = await self.search_articles(session, account)
+                        
+                        # 增加随机等待时间，防止请求过快被风控拦截
+                        await asyncio.sleep(random.uniform(2, 5))
 
                         if account not in history:
                             history[account] = []
