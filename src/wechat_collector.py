@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
-from workflow_config import CollectorConfig
+from config import CollectorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -57,16 +57,12 @@ class WeChatCollector:
             json.dump(history, file, ensure_ascii=False, indent=2)
 
     async def check_login(self, session: ClientSession) -> bool:
-        try:
-            response = await session.call_tool("check_login_status", {})
-            status = response.content[0].text
-            return status == "LOGGED_IN"
-        except Exception as error:
-            logger.error("检查登录状态失败：%s", error)
-            return False
+        response = await session.call_tool("check_login_status", {})
+        status = response.content[0].text
+        return status == "LOGGED_IN"
 
     async def get_qrcode_and_wait(self, session: ClientSession) -> None:
-        logger.info("未登录，准备拉取二维码...")
+        logger.info("检查登录状态，准备拉取二维码...")
         response = await session.call_tool("get_login_qrcode", {})
         content = response.content[0]
 
@@ -82,14 +78,10 @@ class WeChatCollector:
             logger.info("检测到已登录。")
             return
 
-        try:
-            qr_bytes = base64.b64decode(qr_data)
-            with open("qrcode.png", "wb") as file:
-                file.write(qr_bytes)
-            logger.info("二维码已保存到 qrcode.png，请微信扫码登录。")
-        except Exception as error:
-            logger.error("二维码保存失败：%s", error)
-            return
+        qr_bytes = base64.b64decode(qr_data)
+        with open("qrcode.png", "wb") as file:
+            file.write(qr_bytes)
+        logger.info("二维码已保存到 qrcode.png，请微信扫码登录。")
 
         logger.info("等待扫码登录...")
         while True:
@@ -103,15 +95,19 @@ class WeChatCollector:
         session: ClientSession,
         account_name: str,
     ) -> List[Dict[str, Any]]:
+        response = await session.call_tool(
+            "search_wechat_articles",
+            {
+                "account_name": account_name,
+                "count": self.config.account_fetch_count,
+            },
+        )
+        if not response.content:
+            logger.warning("公众号 %s 响应内容为空", account_name)
+            return []
+            
+        text_content = response.content[0].text
         try:
-            response = await session.call_tool(
-                "search_wechat_articles",
-                {
-                    "account_name": account_name,
-                    "count": self.config.account_fetch_count,
-                },
-            )
-            text_content = response.content[0].text
             data = json.loads(text_content)
             if isinstance(data, dict) and "articles" in data:
                 return data["articles"]
@@ -119,8 +115,7 @@ class WeChatCollector:
                 return data
         except json.JSONDecodeError:
             logger.warning("公众号 %s 返回非 JSON，响应内容：%s", account_name, text_content)
-        except Exception as error:
-            logger.error("检索公众号失败 [%s]：%s", account_name, error)
+
         return []
 
     async def _dispatch_new_article(self, account: str, article: Dict[str, Any]) -> None:
@@ -142,55 +137,73 @@ class WeChatCollector:
         daily_results: Dict[str, List[Dict[str, Any]]] = {}
 
         os.makedirs(self.config.daily_folder, exist_ok=True)
-        logger.info("连接 MCP 服务：%s", self.config.mcp_server_url)
+        
+        pending_accounts = list(accounts)
+        max_retries = 5
+        retry_count = 0
 
-        try:
-            async with sse_client(self.config.mcp_server_url) as streams:
-                async with ClientSession(streams[0], streams[1]) as session:
-                    await session.initialize()
-                    logger.info("MCP 会话初始化完成。")
+        while pending_accounts and retry_count < max_retries:
+            try:
+                logger.info("连接 MCP 服务：%s", self.config.mcp_server_url)
+                async with sse_client(self.config.mcp_server_url) as streams:
+                    async with ClientSession(streams[0], streams[1]) as session:
+                        await session.initialize()
+                        logger.info("MCP 会话初始化完成。")
 
-                    logged_in = await self.check_login(session)
-                    if not logged_in:
-                        await self.get_qrcode_and_wait(session)
+                        logged_in = await self.check_login(session)
+                        if not logged_in:
+                            await self.get_qrcode_and_wait(session)
 
-                    for index, account in enumerate(accounts, 1):
-                        logger.info("[%s/%s] 采集公众号：%s", index, len(accounts), account)
-                        articles = await self.search_articles(session, account)
-                        
-                        # 增加随机等待时间，防止请求过快被风控拦截
-                        await asyncio.sleep(random.uniform(2, 5))
+                        retry_count = 0
 
-                        if account not in history:
-                            history[account] = []
+                        while pending_accounts:
+                            account = pending_accounts[0]
+                            index = len(accounts) - len(pending_accounts) + 1
+                            logger.info("[%s/%s] 采集公众号：%s", index, len(accounts), account)
+                            
+                            articles = await self.search_articles(session, account)
+                            
+                            await asyncio.sleep(random.uniform(2, 5))
 
-                        known_urls = {
-                            item.get("url", "")
-                            for item in history[account]
-                            if isinstance(item, dict) and item.get("url")
-                        }
-                        new_articles = []
+                            if account not in history:
+                                history[account] = []
 
-                        for article in articles:
-                            if not isinstance(article, dict):
-                                continue
-                            url = article.get("url", "")
-                            if not url or url in known_urls:
-                                continue
-                            article["date_fetched"] = fetch_time_str
-                            history[account].append(article)
-                            new_articles.append(article)
-                            await self._dispatch_new_article(account, article)
+                            known_urls = {
+                                item.get("url", "")
+                                for item in history[account]
+                                if isinstance(item, dict) and item.get("url")
+                            }
+                            new_articles = []
 
-                        if new_articles:
-                            daily_results[account] = new_articles
-                            logger.info("  -> 新增 %s 篇", len(new_articles))
-                        else:
-                            logger.info("  -> 无新增")
+                            for article in articles:
+                                if not isinstance(article, dict):
+                                    continue
+                                url = article.get("url", "")
+                                if not url or url in known_urls:
+                                    continue
+                                article["date_fetched"] = fetch_time_str
+                                history[account].append(article)
+                                new_articles.append(article)
+                                await self._dispatch_new_article(account, article)
 
-                        self.save_history(history)
-        except Exception as error:
-            logger.error("采集流程异常：%s", error, exc_info=True)
+                            if new_articles:
+                                daily_results[account] = new_articles
+                                logger.info("  -> 新增 %s 篇", len(new_articles))
+                            else:
+                                logger.info("  -> 无新增")
+
+                            self.save_history(history)
+                            pending_accounts.pop(0)
+
+            except Exception as error:
+                retry_count += 1
+                logger.error("与 MCP 的通信中断或抛出异常：%s", error)
+                if retry_count < max_retries:
+                    logger.info("等待 10 秒后重新连接... (第 %s 次重试)", retry_count)
+                    await asyncio.sleep(10)
+                else:
+                    logger.error("重试次数耗尽，放弃本次采集流程。")
+                    break
 
         report_path = ""
         if daily_results:

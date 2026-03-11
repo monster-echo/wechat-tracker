@@ -18,4 +18,4 @@ COPY . .
 VOLUME ["/app/pdf_exports", "/app/daily_reports"]
 
 # 在容器启动时执行的主程序
-CMD ["python", "continuous_tracker.py"]
+CMD ["python", "src/main.py"]

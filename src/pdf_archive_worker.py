@@ -7,7 +7,7 @@ from typing import Any, Dict, Tuple
 
 from playwright.async_api import async_playwright
 
-from workflow_config import PdfConfig
+from config import PdfConfig
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ class PdfArchiveWorker:
             if ws_endpoint:
                 browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
             else:
-                browser = await playwright.chromium.launch(headless=True)
+                browser = await playwright.chromium.launch(headless=False)
 
             context = await browser.new_context(
                 user_agent=(
