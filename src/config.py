@@ -25,9 +25,8 @@ def env_int(name: str, default: int) -> int:
 @dataclass(frozen=True)
 class CollectorConfig:
     mcp_server_url: str
-    accounts_file: str
-    history_file: str
-    daily_folder: str
+    mongodb_uri: str
+    db_name: str
     account_fetch_count: int = 10
 
 
@@ -55,9 +54,8 @@ def load_app_config() -> AppConfig:
 
     collector = CollectorConfig(
         mcp_server_url=os.getenv("MCP_SERVER_URL", "https://wechat-mcp.f.rwecho.top/sse"),
-        accounts_file=os.path.join(data_dir, "accounts.txt"),
-        history_file=os.path.join(data_dir, "articles_history.json"),
-        daily_folder=os.path.join(data_dir, "daily_reports"),
+        mongodb_uri=os.getenv("MONGODB_URI", "mongodb://localhost:27017"),
+        db_name=os.getenv("MONGODB_DB_NAME", "wechat_tracker"),
     )
 
     pdf = PdfConfig(

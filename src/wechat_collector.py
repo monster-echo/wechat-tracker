@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
+from motor.motor_asyncio import AsyncIOMotorCollection
 
 from config import CollectorConfig
 
@@ -21,40 +22,20 @@ class WeChatCollector:
     def __init__(
         self,
         config: CollectorConfig,
+        articles_collection: AsyncIOMotorCollection,
+        accounts_collection: AsyncIOMotorCollection,
         on_new_article: Optional[ArticleCallback] = None,
     ):
         self.config = config
+        self.articles_collection = articles_collection
+        self.accounts_collection = accounts_collection
         self.on_new_article = on_new_article
 
-    def load_accounts(self) -> List[str]:
-        accounts_file = self.config.accounts_file
-        if not os.path.exists(accounts_file):
-            logger.warning("请创建账号文件：%s", accounts_file)
-            return []
+    async def load_accounts(self) -> List[str]:
+        cursor = self.accounts_collection.find({"enabled": {"$ne": False}})
+        accounts = await cursor.to_list(length=1000)
+        return [acc["name"] for acc in accounts if "name" in acc]
 
-        with open(accounts_file, "r", encoding="utf-8") as file:
-            return [
-                line.strip()
-                for line in file
-                if line.strip() and not line.strip().startswith("#")
-            ]
-
-    def load_history(self) -> Dict[str, Any]:
-        history_file = self.config.history_file
-        if os.path.exists(history_file):
-            with open(history_file, "r", encoding="utf-8") as file:
-                try:
-                    return json.load(file)
-                except json.JSONDecodeError:
-                    logger.warning("历史文件损坏，已回退为空：%s", history_file)
-                    return {}
-        return {}
-
-    def save_history(self, history: Dict[str, Any]) -> None:
-        history_file = self.config.history_file
-        os.makedirs(os.path.dirname(history_file), exist_ok=True)
-        with open(history_file, "w", encoding="utf-8") as file:
-            json.dump(history, file, ensure_ascii=False, indent=2)
 
     async def check_login(self, session: ClientSession) -> bool:
         response = await session.call_tool("check_login_status", {})
@@ -107,19 +88,32 @@ class WeChatCollector:
             return []
             
         text_content = response.content[0].text
+        articles: List[Dict[str, Any]] = []
         try:
             data = json.loads(text_content)
             if isinstance(data, dict) and "articles" in data:
-                return data["articles"]
-            if isinstance(data, list):
-                return data
+                articles = data["articles"]
+            elif isinstance(data, list):
+                articles = data
         except json.JSONDecodeError:
             logger.warning("公众号 %s 返回非 JSON，响应内容：%s", account_name, text_content)
             wait_time = random.uniform(60, 300)
             logger.info("由于返回非 JSON 数据，随机等待 %.1f 秒...", wait_time)
             await asyncio.sleep(wait_time)
+            return []
 
-        return []
+        # 增加 account 信息，并确保获取作者和发布时间（如果存在）
+        for article in articles:
+            if isinstance(article, dict):
+                article["account"] = account_name
+                # 这些字段通常由 MCP Tool 返回，如果不存在则设为 None 或保持原样
+                if "author" not in article:
+                    article["author"] = article.get("author_name") or "Unknown"
+                if "publish_time" not in article:
+                    # 尝试寻找可能的发布时间字段
+                    article["publish_time"] = article.get("time") or article.get("pub_time")
+                
+        return articles
 
     async def _dispatch_new_article(self, account: str, article: Dict[str, Any]) -> None:
         if self.on_new_article is None:
@@ -129,17 +123,14 @@ class WeChatCollector:
             await result
 
     async def fetch_latest_articles(self) -> Dict[str, Any]:
-        accounts = self.load_accounts()
+        accounts = await self.load_accounts()
         if not accounts:
             logger.warning("账号列表为空，跳过采集。")
             return {"date": datetime.now().strftime("%Y-%m-%d"), "new_count": 0}
 
-        history = self.load_history()
         today_str = datetime.now().strftime("%Y-%m-%d")
         fetch_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        daily_results: Dict[str, List[Dict[str, Any]]] = {}
-
-        os.makedirs(self.config.daily_folder, exist_ok=True)
+        total_new_count = 0
         
         pending_accounts = list(accounts)
         max_retries = 5
@@ -165,37 +156,38 @@ class WeChatCollector:
                             logger.info("[%s/%s] 采集公众号：%s", index, len(accounts), account)
                             
                             articles = await self.search_articles(session, account)
-                            
                             await asyncio.sleep(random.uniform(2, 5))
 
-                            if account not in history:
-                                history[account] = []
-
-                            known_urls = {
-                                item.get("url", "")
-                                for item in history[account]
-                                if isinstance(item, dict) and item.get("url")
-                            }
-                            new_articles = []
-
+                            account_new_count = 0
                             for article in articles:
                                 if not isinstance(article, dict):
                                     continue
                                 url = article.get("url", "")
-                                if not url or url in known_urls:
+                                if not url:
                                     continue
-                                article["date_fetched"] = fetch_time_str
-                                history[account].append(article)
-                                new_articles.append(article)
-                                await self._dispatch_new_article(account, article)
+                                
+                                # 检查是否已存在
+                                existing = await self.articles_collection.find_one({"url": url})
+                                if existing:
+                                    continue
 
-                            if new_articles:
-                                daily_results[account] = new_articles
-                                logger.info("  -> 新增 %s 篇", len(new_articles))
+                                article["date_fetched"] = fetch_time_str
+                                article["pdf_status"] = "pending"
+                                
+                                # 插入数据库
+                                try:
+                                    await self.articles_collection.insert_one(article)
+                                    account_new_count += 1
+                                    total_new_count += 1
+                                    await self._dispatch_new_article(account, article)
+                                except Exception as e:
+                                    logger.error("文章入库失败: %s, error: %s", article.get("title"), e)
+
+                            if account_new_count > 0:
+                                logger.info("  -> 新增 %s 篇", account_new_count)
                             else:
                                 logger.info("  -> 无新增")
 
-                            self.save_history(history)
                             pending_accounts.pop(0)
 
             except Exception as error:
@@ -208,17 +200,8 @@ class WeChatCollector:
                     logger.error("重试次数耗尽，放弃本次采集流程。")
                     break
 
-        report_path = ""
-        if daily_results:
-            report_path = os.path.join(self.config.daily_folder, f"report_{today_str}.json")
-            with open(report_path, "w", encoding="utf-8") as file:
-                json.dump(daily_results, file, ensure_ascii=False, indent=2)
-            logger.info("日报已保存：%s", report_path)
-
-        new_count = sum(len(items) for items in daily_results.values())
         return {
             "date": today_str,
-            "new_count": new_count,
-            "report_path": report_path,
+            "new_count": total_new_count,
             "accounts_count": len(accounts),
         }

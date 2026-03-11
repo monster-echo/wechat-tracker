@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Dict, Tuple
 
 from playwright.async_api import async_playwright
+from motor.motor_asyncio import AsyncIOMotorCollection
 
 from config import PdfConfig
 
@@ -18,8 +19,9 @@ def sanitize_filename(filename: str, max_length: int = 200) -> str:
 
 
 class PdfArchiveWorker:
-    def __init__(self, config: PdfConfig):
+    def __init__(self, config: PdfConfig, collection: AsyncIOMotorCollection):
         self.config = config
+        self.collection = collection
         self.queue: asyncio.Queue[Tuple[str, Dict[str, Any]]] = asyncio.Queue()
         self._task: asyncio.Task | None = None
 
@@ -140,6 +142,30 @@ class PdfArchiveWorker:
                 await page.wait_for_timeout(5000)
                 await page.pdf(path=pdf_path, format="A4")
                 logger.info("PDF 已保存：%s", pdf_path)
+                
+                # 更新数据库状态
+                await self.collection.update_one(
+                    {"url": url},
+                    {
+                        "$set": {
+                            "pdf_status": "success",
+                            "pdf_path": pdf_path,
+                            "date_exported": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        }
+                    }
+                )
+            except Exception as e:
+                logger.error("PDF 导出失败：%s, error: %s", article.get("title"), e)
+                # 更新数据库状态为失败
+                await self.collection.update_one(
+                    {"url": url},
+                    {
+                        "$set": {
+                            "pdf_status": "failed",
+                            "pdf_error": str(e)
+                        }
+                    }
+                )
             finally:
                 try:
                     await page.close()

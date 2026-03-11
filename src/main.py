@@ -5,6 +5,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pdf_archive_worker import PdfArchiveWorker
 from wechat_collector import WeChatCollector
 from config import AppConfig, load_app_config
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,10 +20,18 @@ class WeChatTracker:
     def __init__(self, config: AppConfig):
         self.config = config
         self.scheduler = AsyncIOScheduler()
+        
+        # 初始化 MongoDB
+        client = AsyncIOMotorClient(config.collector.mongodb_uri)
+        db = client[config.collector.db_name]
+        self.articles_collection = db["articles"]
+        self.accounts_collection = db["accounts"]
 
-        self.pdf_worker = PdfArchiveWorker(config.pdf)
+        self.pdf_worker = PdfArchiveWorker(config.pdf, self.articles_collection)
         self.collector = WeChatCollector(
             config=config.collector,
+            articles_collection=self.articles_collection,
+            accounts_collection=self.accounts_collection,
             on_new_article=self._on_new_article,
         )
 
@@ -46,6 +57,14 @@ class WeChatTracker:
 
     async def start(self) -> None:
         logger.info("初始化调度器...")
+        
+        # 创建索引
+        await self.articles_collection.create_index("url", unique=True)
+        await self.accounts_collection.create_index("name", unique=True)
+
+        # 尝试从 accounts.txt 迁移数据
+        await self._migrate_accounts_if_needed()
+        
         self.pdf_worker.start()
         self.register_jobs()
         self.scheduler.start()
@@ -55,6 +74,39 @@ class WeChatTracker:
         logger.info("系统运行中，按 Ctrl+C 停止。")
         while True:
             await asyncio.sleep(3600)
+
+    async def _migrate_accounts_if_needed(self) -> None:
+        count = await self.accounts_collection.count_documents({})
+        if count > 0:
+            return
+
+        # 查找旧的 accounts.txt
+        data_dir = os.getenv("WECHAT_DATA_DIR", "data")
+        old_file = os.path.join(data_dir, "accounts.txt")
+        if not os.path.exists(old_file):
+            return
+
+        logger.info("发现旧的 accounts.txt，正在迁移到数据库...")
+        try:
+            with open(old_file, "r", encoding="utf-8") as f:
+                accounts = [
+                    line.strip()
+                    for line in f
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+            
+            for name in accounts:
+                try:
+                    await self.accounts_collection.update_one(
+                        {"name": name},
+                        {"$set": {"name": name, "enabled": True, "created_at": datetime.now()}},
+                        upsert=True
+                    )
+                except Exception as e:
+                    logger.error("迁移帐号失败 %s: %s", name, e)
+            logger.info("帐号迁移完成共 %d 个。", len(accounts))
+        except Exception as e:
+            logger.error("读取旧帐号文件失败: %s", e)
 
     async def shutdown(self) -> None:
         logger.info("准备关闭调度器与后台任务...")
