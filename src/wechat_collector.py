@@ -115,6 +115,9 @@ class WeChatCollector:
                 return data
         except json.JSONDecodeError:
             logger.warning("公众号 %s 返回非 JSON，响应内容：%s", account_name, text_content)
+            wait_time = random.uniform(60, 300)
+            logger.info("由于返回非 JSON 数据，随机等待 %.1f 秒...", wait_time)
+            await asyncio.sleep(wait_time)
 
         return []
 
