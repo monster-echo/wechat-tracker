@@ -66,6 +66,10 @@ class WeChatTracker:
         await self._migrate_accounts_if_needed()
         
         self.pdf_worker.start()
+        
+        # 启动时处理待处理的文章
+        await self._enqueue_pending_articles()
+        
         self.register_jobs()
         self.scheduler.start()
         
@@ -74,6 +78,20 @@ class WeChatTracker:
         logger.info("系统运行中，按 Ctrl+C 停止。")
         while True:
             await asyncio.sleep(3600)
+
+    async def _enqueue_pending_articles(self) -> None:
+        logger.info("正在检查待处理的文章...")
+        cursor = self.articles_collection.find({"pdf_status": "pending"})
+        pending_count = 0
+        async for article in cursor:
+            account = article.get("account", "Unknown")
+            await self.pdf_worker.enqueue(account, article)
+            pending_count += 1
+        
+        if pending_count > 0:
+            logger.info("已将 %d 篇待处理文章加入队列。", pending_count)
+        else:
+            logger.info("没有待处理的文章。")
 
     async def _migrate_accounts_if_needed(self) -> None:
         count = await self.accounts_collection.count_documents({})
